@@ -20,6 +20,10 @@ Concatenated Image(256x1024) -> [ImageBackbone:ResNet34] -> Image tokens
 
 LiDAR Tokens + Image Tokens -> [CrossAttention] -> Env Tokens
 
+### Transfusion
+
+All the perception process above is performed by [Transfusion] module. Transfusion module takes in 
+
 ## Trajectory Decoder
 
 Planning Vocabulary (Q) + Env Tokens (K,V) -> [TransformerDecoder] -> 1. [ScoreMLP] -> Imitation Score

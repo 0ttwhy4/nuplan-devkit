@@ -311,7 +311,7 @@ def multi_head_attention_forward(query,  # type: Tensor
         - value: :math:`(S, N, E)` where S is the source sequence length, N is the batch size, E is
           the embedding dimension.
         - key_padding_mask: :math:`(N, S)`, ByteTensor, where N is the batch size, S is the source sequence length.
-        - attn_mask: :math:`(L, S)` where L is the target sequence length, S is the source sequence length.
+        - attn_mask: :math:`(L, S)` where L is the target sequence length, S is the source sequence length. (Note that attn_mask is applied on attention_output_weight)
         - static_k: :math:`(N*num_heads, S, E/num_heads)`, where S is the source sequence length,
           N is the batch size, E is the embedding dimension. E/num_heads is the head dimension.
         - static_v: :math:`(N*num_heads, S, E/num_heads)`, where S is the source sequence length,
@@ -410,7 +410,7 @@ def multi_head_attention_forward(query,  # type: Tensor
         # below the proj_weight can be either tensor or None, which does not need to be process respectively,
         # if the weight is none, the F.linear will randomly initialize
         # probably for loading weight from checkpoints
-        if in_proj_bias is not None:
+        if in_proj_bias is not None: # so that the module can be used in both training (random initialization) and inference (loading fixed weights)
             q = F.linear(query, q_proj_weight_non_opt, in_proj_bias[0:embed_dim])
             k = F.linear(key, k_proj_weight_non_opt, in_proj_bias[embed_dim:(embed_dim * 2)])
             v = F.linear(value, v_proj_weight_non_opt, in_proj_bias[(embed_dim * 2):])
@@ -441,6 +441,9 @@ def multi_head_attention_forward(query,  # type: Tensor
         assert bias_k is None
         assert bias_v is None
 
+    # here the contiguous method is called to ensure the q, k, and v are stored in a c
+    # ontiguous block of memory, which is especially important when calling .view() to 
+    # reshape the tensor 
     q = q.contiguous().view(tgt_len, bsz * num_heads, head_dim).transpose(0, 1)
     if k is not None:
         k = k.contiguous().view(-1, bsz * num_heads, head_dim).transpose(0, 1)
@@ -463,8 +466,11 @@ def multi_head_attention_forward(query,  # type: Tensor
         assert key_padding_mask.size(0) == bsz
         assert key_padding_mask.size(1) == src_len
 
+    # k size (bsz * num_heads, src_len, head_dim)
     if add_zero_attn:
+        # TODO: WHY ARE WE ADDING ZEROS?
         src_len += 1
+        # shape of zeros: (k.size(0), 1, "the rest dim of k")
         k = torch.cat([k, torch.zeros((k.size(0), 1) + k.size()[2:], dtype=k.dtype, device=k.device)], dim=1)
         v = torch.cat([v, torch.zeros((v.size(0), 1) + v.size()[2:], dtype=v.dtype, device=v.device)], dim=1)
         if attn_mask is not None:
@@ -492,11 +498,10 @@ def multi_head_attention_forward(query,  # type: Tensor
         )
         attn_output_weights = attn_output_weights.view(bsz * num_heads, tgt_len, src_len)
 
-    attn_output_weights = F.softmax(
-        attn_output_weights, dim=-1)
+    attn_output_weights = F.softmax(attn_output_weights, dim=-1)
     attn_output_weights = F.dropout(attn_output_weights, p=dropout_p, training=training)
 
-    attn_output = torch.bmm(attn_output_weights, v)
+    attn_output = torch.bmm(attn_output_weights, v) # v (bsz * num_heads, tgt_len, head_dim)
     assert list(attn_output.size()) == [bsz * num_heads, tgt_len, head_dim]
     attn_output = attn_output.transpose(0, 1).contiguous().view(tgt_len, bsz, embed_dim)
     attn_output = F.linear(attn_output, out_proj_weight, out_proj_bias)
@@ -693,7 +698,7 @@ class TransFusionHead(nn.Module):
                 padding=1,
                 bias=bias,
             ))
-            self.heatmap_head = nn.Sequential(*layers)
+            self.heatmap_head = nn.Sequential(*layers) # produce the dense class map for lidar
             self.class_encoding = nn.Conv1d(num_classes, hidden_channel, 1)
         else:
             # query feature
@@ -721,7 +726,7 @@ class TransFusionHead(nn.Module):
         if self.fuse_img:
             self.num_views = num_views
             self.out_size_factor_img = out_size_factor_img
-            self.shared_conv_img = build_conv_layer(
+            self.shared_conv_img = build_conv_layer( # CNN for image feature extracting
                 dict(type='Conv2d'),
                 in_channels_img,  # channel of img feature map
                 hidden_channel,
@@ -764,6 +769,11 @@ class TransFusionHead(nn.Module):
         self.img_feat_collapsed_pos = None
 
     def create_2D_grid(self, x_size, y_size):
+        '''
+        Given two tensors x and y, torch.meshgrid(x, y, indexing='ij') creates two two dimensional grids shaped as [x.size, y.size],
+        where the coordinate of the (i, j) element is (grid_x[i][j], grid_y[i][j]) 
+        Return: coord_base[i][j] = [j, i]
+        '''
         meshgrid = [[0, x_size - 1, x_size], [0, y_size - 1, y_size]]
         batch_y, batch_x = torch.meshgrid(*[torch.linspace(it[0], it[1], it[2]) for it in meshgrid])
         batch_x = batch_x + 0.5
@@ -827,7 +837,7 @@ class TransFusionHead(nn.Module):
             img_h, img_w, num_channel = img_inputs.shape[-2], img_inputs.shape[-1], img_feat.shape[1]
             raw_img_feat = img_feat.view(batch_size, self.num_views, num_channel, img_h, img_w).permute(0, 2, 3, 1, 4) # [BS, C, H, n_views, W]
             img_feat = raw_img_feat.reshape(batch_size, num_channel, img_h, img_w * self.num_views)  # [BS, C, H, n_views*W]
-            img_feat_collapsed = img_feat.max(2).values
+            img_feat_collapsed = img_feat.max(2).values # taking the maximum value of feature on H dimension -> compression
             img_feat_collapsed = self.fc(img_feat_collapsed).view(batch_size, num_channel, img_w * self.num_views)
 
             # positional encoding for image guided query initialization
@@ -844,10 +854,12 @@ class TransFusionHead(nn.Module):
         # image guided query initialization
         #################################
         if self.initialize_by_heatmap:
-            dense_heatmap = self.heatmap_head(lidar_feat)
+            dense_heatmap = self.heatmap_head(lidar_feat) # heatmap_head: conv net
             dense_heatmap_img = None
             if self.fuse_img:
+                # here the bev_feat is lidar feature mixed with img feature by cross-attention
                 dense_heatmap_img = self.heatmap_head_img(bev_feat.view(lidar_feat.shape))  # [BS, num_classes, H, W]
+                # here the heatmap is a dense segmentation map of logits of each pixel belonging to the given classes.
                 heatmap = (dense_heatmap.detach().sigmoid() + dense_heatmap_img.detach().sigmoid()) / 2
             else:
                 heatmap = dense_heatmap.detach().sigmoid()
@@ -855,8 +867,12 @@ class TransFusionHead(nn.Module):
             local_max = torch.zeros_like(heatmap)
             # equals to nms radius = voxel_size * out_size_factor * kenel_size
             local_max_inner = F.max_pool2d(heatmap, kernel_size=self.nms_kernel_size, stride=1, padding=0)
+            # in the dense heat map every pixel is assigned with a group of logits for each class, and here the nms is to
+            # assigh logits to the pixels within the region determined by the kernel size 
             local_max[:, :, padding:(-padding), padding:(-padding)] = local_max_inner
+            # skip the margin on the edge
             ## for Pedestrian & Traffic_cone in nuScenes
+            # note that pedestrian and traffic cone a small object, thus requiring dense heat map
             if self.test_cfg['dataset'] == 'nuScenes':
                 local_max[:, 8, ] = F.max_pool2d(heatmap[:, 8], kernel_size=1, stride=1, padding=0)
                 local_max[:, 9, ] = F.max_pool2d(heatmap[:, 9], kernel_size=1, stride=1, padding=0)
@@ -870,7 +886,7 @@ class TransFusionHead(nn.Module):
             top_proposals = heatmap.view(batch_size, -1).argsort(dim=-1, descending=True)[..., :self.num_proposals]
             top_proposals_class = top_proposals // heatmap.shape[-1]
             top_proposals_index = top_proposals % heatmap.shape[-1]
-            query_feat = lidar_feat_flatten.gather(index=top_proposals_index[:, None, :].expand(-1, lidar_feat_flatten.shape[1], -1), dim=-1)
+            query_feat = lidar_feat_flatten.gather(index=top_proposals_index[:, None, :].expand(-1, lidar_feat_flatten.shape[1], -1), dim=-1) # here None is equal to .unsqueeze(dim) to keep the dimension aligned with lidar_feat_flatten
             self.query_labels = top_proposals_class
 
             # add category embedding
@@ -1114,7 +1130,7 @@ class TransFusionHead(nn.Module):
         """
         num_proposals = preds_dict['center'].shape[-1]
 
-        # get pred boxes, carefully ! donot change the network outputs
+        # get pred boxes, carefully ! do not change the network outputs
         score = copy.deepcopy(preds_dict['heatmap'].detach())
         center = copy.deepcopy(preds_dict['center'].detach())
         height = copy.deepcopy(preds_dict['height'].detach())
